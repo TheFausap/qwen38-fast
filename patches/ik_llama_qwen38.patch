@@ -1,0 +1,536 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index db2747b..3bcc5b6 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2656,6 +2656,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     size_t moe_next  = 0; // first moe_infos entry with split >= current split
+     size_t moe_enq   = 0; // moe_infos entries already enqueued for lookahead
+ 
++    static const bool ik_prof = getenv("IK_SPLIT_PROFILE") != NULL;
++    static int64_t prof_steps = 0, prof_copy = 0, prof_pref = 0, prof_gpu = 0, prof_cpu = 0, prof_sync = 0;
++    static int64_t prof_cpu_moe = 0, prof_cpu_getrows = 0, prof_cpu_other = 0;
++    static int64_t prof_cpu_splits_moe = 0, prof_cpu_splits_other = 0;
++    int64_t t_step0 = ik_prof ? ggml_time_us() : 0;
++
+     for (int i = 0; i < sched->n_splits; i++) {
+ #if IK_PRINT_TIMING
+         int64_t tim1 = ggml_time_us();
+@@ -2664,6 +2670,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        int64_t tp0 = ik_prof ? ggml_time_us() : 0;
+         if (moe_prefetch && !moe_infos.empty()) {
+             while (moe_next < moe_infos.size() && moe_infos[moe_next].split < i) {
+                 moe_next++;
+@@ -2680,9 +2687,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 moe_enq = k + 1;
+             }
+         }
++        int64_t tp1 = ik_prof ? ggml_time_us() : 0;
++        if (ik_prof) prof_pref += tp1 - tp0;
+ 
+         // copy the input tensors to the split backend
+         auto copy_status = ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
++        int64_t tp2 = ik_prof ? ggml_time_us() : 0;
++        if (ik_prof) prof_copy += tp2 - tp1;
+ 
+         // ids are now final and host-visible; enqueue the selected expert
+         // slices of this split's host-computed MoE matmuls (up/gate and down
+@@ -2692,6 +2703,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 ggml_moe_prefetch_node(node);
+             }
+         }
++        int64_t tp3 = ik_prof ? ggml_time_us() : 0;
++        if (ik_prof) prof_pref += tp3 - tp2;
+ 
+         if (!copy_status) {
+             if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
+@@ -2708,6 +2721,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         if (ec != GGML_STATUS_SUCCESS) {
+             return ec;
+         }
++        if (ik_prof) {
++            int64_t tp4 = ggml_time_us();
++            if (ggml_backend_is_cpu(split_backend)) {
++                int64_t dt = tp4 - tp3;
++                prof_cpu += dt;
++                bool has_moe = false, has_gr = false;
++                for (int nn = 0; nn < split->graph.n_nodes; ++nn) {
++                    enum ggml_op op = split->graph.nodes[nn]->op;
++                    if (op == GGML_OP_MUL_MAT_ID || op == GGML_OP_MOE_FUSED_UP_GATE) has_moe = true;
++                    if (op == GGML_OP_GET_ROWS) has_gr = true;
++                }
++                if (has_moe) { prof_cpu_moe += dt; prof_cpu_splits_moe++; }
++                else if (has_gr) { prof_cpu_getrows += dt; }
++                else {
++                    prof_cpu_other += dt;
++                    prof_cpu_splits_other++;
++                    if (prof_steps == 5) {
++                        fprintf(stderr, "  [CPU_OTHER split %d, n=%d, %.2fms] op0=%s (%s)\n",
++                                i, split->graph.n_nodes, dt / 1000.0,
++                                split->graph.n_nodes > 0 ? ggml_op_name(split->graph.nodes[0]->op) : "?",
++                                split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "?");
++                    }
++                }
++            } else {
++                // Note: GPU graph launch is async until copy_inputs syncs, so sync only when profiling
++                ggml_backend_synchronize(split_backend);
++                int64_t tp5 = ggml_time_us();
++                prof_gpu += tp5 - tp3;
++            }
++        }
+ 
+         // the pages the lookahead streamer just read for this split are one-shot
+         // streaming traffic; MADV_COLD them so the decode working set survives
+@@ -2726,6 +2769,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+     }
+ 
++    if (ik_prof) {
++        prof_steps++;
++        prof_sync += (ggml_time_us() - t_step0);
++        if (prof_steps % 32 == 0) {
++            fprintf(stderr, "[IK_SPLIT_PROFILE] avg over %lld steps (ms): total=%.2f | gpu=%.2f | cpu=%.2f (moe=%.2f getrows=%.2f other=%.2f) | copy=%.2f | pref=%.2f\n",
++                    (long long)prof_steps,
++                    prof_sync / (1000.0 * prof_steps),
++                    prof_gpu  / (1000.0 * prof_steps),
++                    prof_cpu  / (1000.0 * prof_steps),
++                    prof_cpu_moe / (1000.0 * prof_steps),
++                    prof_cpu_getrows / (1000.0 * prof_steps),
++                    prof_cpu_other / (1000.0 * prof_steps),
++                    prof_copy / (1000.0 * prof_steps),
++                    prof_pref / (1000.0 * prof_steps));
++        }
++    }
++
+     sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
+ 
+     return GGML_STATUS_SUCCESS;
+diff --git a/ggml/src/ggml-moe-prefetch.cpp b/ggml/src/ggml-moe-prefetch.cpp
+index 52075f6..220f8ea 100644
+--- a/ggml/src/ggml-moe-prefetch.cpp
++++ b/ggml/src/ggml-moe-prefetch.cpp
+@@ -454,6 +454,82 @@ void ggml_moe_prefetch_kernel_hook(const struct ggml_tensor * node, int ith) {
+     ggml_moe_prefetch_node(node);
+ }
+ 
++int ggml_moe_hot_experts_count(void) {
++    static int cached = -1;
++    if (cached < 0) {
++        const char * env = getenv("IK_HOT_EXPERTS");
++        cached = (env && env[0]) ? std::max(0, atoi(env)) : 0;
++    }
++    return cached;
++}
++
++void ggml_moe_cold_tail_advise(const struct ggml_tensor * w0, const struct ggml_tensor * w1, const struct ggml_tensor * ids) {
++    const int k_hot = ggml_moe_hot_experts_count();
++    if (k_hot <= 0 || !w0 || !w0->data || !ids || !ids->data) return;
++    if (w0->ne[2] <= k_hot) return;
++    const long page = sysconf(_SC_PAGESIZE);
++    const uintptr_t pmask = (uintptr_t)(page - 1);
++    auto advise_tensor = [&](const struct ggml_tensor * w) {
++        if (!w || !w->data || w->ne[2] <= k_hot) return;
++        const size_t stride = w->nb[2];
++        const size_t wbytes = ggml_nbytes(w);
++        const char * base = (const char *)w->data;
++        for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
++            for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
++                const int32_t id = *(const int32_t *)((const char *)ids->data + i1*ids->nb[1] + i0*ids->nb[0]);
++                if (id < k_hot || id >= w->ne[2]) continue;
++                const size_t off = (size_t)id * stride;
++                const size_t len = std::min(stride, wbytes - off);
++                if (off < wbytes && len > 0) {
++                    const uintptr_t s = (uintptr_t)(base + off);
++                    const uintptr_t a = s & ~pmask;
++                    (void) madvise((void *)a, (size_t)(s + len - a), MADV_COLD);
++                }
++            }
++        }
++    };
++    advise_tensor(w0);
++    if (w1) advise_tensor(w1);
++}
++
++void ggml_ple_row_advise_cold(const void * row_ptr, size_t row_bytes) {
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char * env = getenv("IK_PLE_MADV_COLD");
++        enabled = (env && env[0] == '0') ? 0 : 1; // enabled by default for huge PLE tables
++    }
++    if (!enabled || !row_ptr || row_bytes == 0) return;
++    static long page = 0;
++    if (page == 0) page = sysconf(_SC_PAGESIZE);
++    const uintptr_t s = (uintptr_t)row_ptr;
++    const uintptr_t a = s & ~(uintptr_t)(page - 1);
++    const size_t len = ((s + row_bytes + (uintptr_t)page - 1) & ~(uintptr_t)(page - 1)) - a;
++    (void) madvise((void *)a, len, MADV_COLD);
++}
++
++void ggml_moe_warm_hot_prefix(const void * data, size_t hot_bytes, size_t total_bytes) {
++    if (!data || total_bytes == 0) return;
++    const long page = sysconf(_SC_PAGESIZE);
++    const uintptr_t pmask = (uintptr_t)(page - 1);
++    const uintptr_t base = (uintptr_t)data;
++    if (hot_bytes < total_bytes) {
++        const uintptr_t cs = (base + hot_bytes + pmask) & ~pmask;
++        const uintptr_t ce = (base + total_bytes) & ~pmask;
++        if (ce > cs) {
++            (void) madvise((void *)cs, ce - cs, MADV_RANDOM);
++            (void) madvise((void *)cs, ce - cs, MADV_DONTNEED);
++        }
++    }
++    if (hot_bytes > 0) {
++        const uintptr_t hs = base & ~pmask;
++        const uintptr_t he = (base + std::min(hot_bytes, total_bytes) + pmask) & ~pmask;
++        if (he > hs) {
++            (void) madvise((void *)hs, he - hs, MADV_WILLNEED);
++            (void) madvise((void *)hs, he - hs, MADV_POPULATE_READ);
++        }
++    }
++}
++
+ #else // !__linux__
+ 
+ void ggml_moe_prefetch_register_mapping(const void *, size_t) {}
+@@ -466,5 +542,9 @@ void ggml_moe_prefetch_tensor(const struct ggml_tensor *) {}
+ void ggml_moe_prefetch_wait(const struct ggml_tensor *) {}
+ void ggml_moe_prefetch_kernel_hook(const struct ggml_tensor *, int) {}
+ void ggml_moe_prefetch_cold(const struct ggml_tensor *) {}
++int  ggml_moe_hot_experts_count(void) { return 0; }
++void ggml_moe_cold_tail_advise(const struct ggml_tensor *, const struct ggml_tensor *, const struct ggml_tensor *) {}
++void ggml_ple_row_advise_cold(const void *, size_t) {}
++void ggml_moe_warm_hot_prefix(const void *, size_t, size_t) {}
+ 
+ #endif
+diff --git a/ggml/src/ggml-moe-prefetch.h b/ggml/src/ggml-moe-prefetch.h
+index 5e323d7..70389d7 100644
+--- a/ggml/src/ggml-moe-prefetch.h
++++ b/ggml/src/ggml-moe-prefetch.h
+@@ -47,6 +47,12 @@ void ggml_moe_prefetch_cold(const struct ggml_tensor * w);
+ // madvise(MADV_WILLNEED) when the engine is off.
+ void ggml_moe_prefetch_kernel_hook(const struct ggml_tensor * node, int ith);
+ 
++// Frequency-sorted expert tiering (IK_HOT_EXPERTS=N) & zero-eviction PLE helpers
++GGML_API int  ggml_moe_hot_experts_count(void);
++GGML_API void ggml_moe_cold_tail_advise(const struct ggml_tensor * w0, const struct ggml_tensor * w1, const struct ggml_tensor * ids);
++GGML_API void ggml_ple_row_advise_cold(const void * row_ptr, size_t row_bytes);
++GGML_API void ggml_moe_warm_hot_prefix(const void * data, size_t hot_bytes, size_t total_bytes);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 57454ef..bbfd017 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -19382,6 +19382,19 @@ static void ggml_compute_forward_mul_mat_id(
+ 
+             chunk_id = atomic_fetch_add(&params->shared->current_chunk, 1);
+         }
++        const int k_hot_mm = ggml_moe_hot_experts_count();
++        if (k_hot_mm > 0 && n_as > k_hot_mm) {
++            bool has_cold = false;
++            for (int a = k_hot_mm; a < n_as; ++a) {
++                if (matrix_row_counts[a] > 0) { has_cold = true; break; }
++            }
++            if (has_cold) {
++                ggml_barrier(params->shared);
++                if (ith == 0) {
++                    ggml_moe_cold_tail_advise(src0, NULL, ids);
++                }
++            }
++        }
+         return;
+     }
+ IQK_MulMat_Not_Available0:;
+@@ -19740,6 +19753,19 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
+ 
+         chunk_id_ug = atomic_fetch_add(&params->shared->current_chunk, 1);
+     }
++    const int k_hot_ug = ggml_moe_hot_experts_count();
++    if (k_hot_ug > 0 && n_as > k_hot_ug) {
++        bool has_cold = false;
++        for (int a = k_hot_ug; a < n_as; ++a) {
++            if (matrix_row_counts[a] > 0) { has_cold = true; break; }
++        }
++        if (has_cold) {
++            ggml_barrier(params->shared);
++            if (ith == 0) {
++                ggml_moe_cold_tail_advise(src0_1, src0_2, ids);
++            }
++        }
++    }
+ 
+ #else
+ 
+@@ -20758,9 +20784,13 @@ static void ggml_compute_forward_get_rows_q(
+         }
+         //assert(i01 >= 0 && i01 < ne01);
+ 
++        const void * row_src = (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03);
+         dequantize_row_q(
+-                (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
++                row_src,
+                      (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
++        if (ne01 > 10000000) {
++            ggml_ple_row_advise_cold(row_src, nb01);
++        }
+     }
+ }
+ 
+diff --git a/src/llama-build-context.cpp b/src/llama-build-context.cpp
+index d891bd4..e9148ed 100644
+--- a/src/llama-build-context.cpp
++++ b/src/llama-build-context.cpp
+@@ -1845,9 +1845,13 @@ llm_expert_gating_func_type   gating_op,
+         if (grouped_routing && n_tokens > 0) {
+             auto& hparams = lctx.model.hparams;
+             selected_experts = ggml_grouped_topk(ctx, selection_probs, hparams.n_expert_groups, hparams.n_group_used, 2, n_expert_used);
++        } else if (lctx.cparams.min_experts > 0 && lctx.cparams.thresh_experts > 0.0f &&
++                down_exps && down_exps->buffer && ggml_backend_buffer_is_host(down_exps->buffer) &&
++                (!up_exps || !up_exps->buffer || ggml_backend_buffer_is_host(up_exps->buffer)) &&
++                (!lctx.moe_cache || !lctx.moe_cache->get_experts(down_exps))) {
++            selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
++                    lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens]
+         } else {
+-            //selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
+-            //        lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens]
+             selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+         }
+     }
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 074d8d6..44bdd89 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -129,6 +129,9 @@ struct llama_moe_cache::impl {
+     mutable size_t incompatible_layer_skips = 0;
+     bool periodic_enabled = false;
+     bool periodic_track_cpu = false;
++    bool static_hot_cache = false;
++    std::vector<int32_t> static_k_layer;
++    std::vector<int32_t> static_slot_base;
+     uint64_t periodic_graph_generation = 0;
+     uint64_t periodic_tg_tokens = 0;
+     std::vector<uint8_t> periodic_observed_cpu;
+@@ -142,6 +145,10 @@ struct llama_moe_cache::impl {
+             throw std::invalid_argument("MoE cache CPU share must be finite and in [0,1]");
+         }
+         if (cpu_share_q16 == 0) cpu_share = 0.0;
++        {
++            const char * env_static = std::getenv("IK_GPU_STATIC_HOT_CACHE");
++            static_hot_cache = (env_static && env_static[0] && env_static[0] != '0' && cpu_share_q16 != 0);
++        }
+         token_geometry_maps = policy == LLAMA_MOE_CACHE_POLICY_CLASSLRU || cpu_share_q16 != 0;
+         if (model.hparams.n_expert == 0 || n_expert_used <= 0) {
+             throw std::runtime_error("MoE cache requires a MoE model");
+@@ -162,6 +169,18 @@ struct llama_moe_cache::impl {
+         for (size_t il = 0; il < model.layers.size(); ++il) {
+             auto experts = layer_experts(model.layers[il]);
+             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), is_host_weight)) continue;
++            if (static_hot_cache) {
++                // Skip CPU-only quant types (e.g. IQ2_XXS_R4) so 100% of GPU VRAM budget
++                // pins hot experts on CUDA-native layers with zero fallback thrashing.
++                bool all_cuda_ok = true;
++                for (const ggml_tensor * t : experts) {
++                    if (t->type == GGML_TYPE_IQ2_XXS_R4 || t->type == GGML_TYPE_IQ1_S_R4 || t->type == GGML_TYPE_IQ2_XS_R4) {
++                        all_cuda_ok = false;
++                        break;
++                    }
++                }
++                if (!all_cuda_ok) continue;
++            }
+             if (!std::all_of(experts.begin(), experts.end(), [&](const ggml_tensor * t) {
+                     return t->ne[2] == experts[0]->ne[2];
+                 })) continue;
+@@ -349,7 +368,50 @@ struct llama_moe_cache::impl {
+             }
+         }
+         LLAMA_LOG_INFO("%s: active MoE cache policy: %s\n", __func__,
+-                policy == LLAMA_MOE_CACHE_POLICY_CLASSLRU ? "classlru" : "lru");
++                static_hot_cache ? "static-hot-prefix (0 runtime PCIe uploads)" :
++                (policy == LLAMA_MOE_CACHE_POLICY_CLASSLRU ? "classlru" : "lru"));
++
++        if (static_hot_cache) {
++            periodic_enabled = false;
++            static_k_layer.assign(layers.size(), 0);
++            static_slot_base.assign(layers.size(), 0);
++            for (group & g : groups) {
++                if (g.n_slots <= 0 || !g.cpu_share_enabled || g.layers.empty()) continue;
++                const int32_t k_per_layer = std::min<int32_t>(n_expert, g.n_slots / (int32_t) g.layers.size());
++                if (k_per_layer <= 0) continue;
++                size_t total_uploaded = 0;
++                for (size_t idx = 0; idx < g.layers.size(); ++idx) {
++                    const int32_t il = g.layers[idx];
++                    const int32_t sbase = (int32_t) idx * k_per_layer;
++                    static_k_layer[il] = k_per_layer;
++                    static_slot_base[il] = sbase;
++                    layer & l = layers[il];
++                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                        const ggml_tensor * w = l.experts[ip];
++                        ggml_tensor * bank = g.banks[ip];
++                        const size_t expert_size = w->nb[2];
++                        ggml_backend_tensor_set(bank,
++                                (const uint8_t *) w->data,
++                                (size_t) sbase * expert_size,
++                                (size_t) k_per_layer * expert_size);
++                        total_uploaded += (size_t) k_per_layer * expert_size;
++                    }
++                    int32_t * smap = g.cache.slot_map[il];
++                    for (int32_t e = 0; e < n_expert; ++e) {
++                        if (e < k_per_layer) {
++                            const int32_t slot = sbase + e;
++                            smap[e] = slot;
++                            g.cache.key_of[slot] = g.cache.make_key(il, e);
++                        } else {
++                            smap[e] = -1;
++                        }
++                    }
++                }
++                g.cache.filled_real_slots = (size_t) k_per_layer * g.layers.size();
++                LLAMA_LOG_INFO("%s: IK_GPU_STATIC_HOT_CACHE pinned top %d/%d experts/layer across %zu layers (%.2f MiB uploaded once)\n",
++                        __func__, k_per_layer, n_expert, g.layers.size(), total_uploaded / 1048576.0);
++            }
++        }
+     }
+ 
+     ~impl() { log_stats(); }
+@@ -362,6 +424,7 @@ struct llama_moe_cache::impl {
+     bool requires_token_geometry_maps() const { return token_geometry_maps; }
+ 
+     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
++        if (static_hot_cache) return nullptr;
+         if (il < 0 || (size_t) il >= layers.size() || layers[il].group < 0) {
+             ++incompatible_layer_skips;
+             return nullptr;
+@@ -383,6 +446,7 @@ struct llama_moe_cache::impl {
+     llama_moe_cache::cpu_share_maps get_cpu_share_maps(int32_t il, int64_t n_tokens,
+             int64_t n_expert_used) const {
+         if (cpu_share_q16 == 0 || il < 0 || (size_t) il >= layers.size()) return {};
++        if (static_hot_cache && n_tokens > 8) return {};
+         const layer & l = layers[il];
+         if (!l.gpu_map || l.group < 0) return {};
+         const group & g = groups[l.group];
+@@ -680,7 +744,56 @@ struct llama_moe_cache::impl {
+                 } else {
+                     GGML_ABORT("CPU-share selected IDs use unsupported buffer type for layer %d", il);
+                 }
+-                if (!g.cache.plan_with_cpu_share(il, ids.data(), ids.size(), n_tokens, selected_per_token,
++                if (static_hot_cache && static_k_layer[il] > 0) {
++                    const int32_t k_hot_gpu = static_k_layer[il];
++                    const int32_t sbase = static_slot_base[il];
++                    auto & sp = l.share_plan;
++                    sp.fills.clear();
++                    sp.cpu.clear();
++                    sp.gpu_map.assign(n_expert, -1);
++                    sp.cpu_map.assign(n_expert, -1);
++                    sp.gpu_bias_map.assign(n_expert, n_expert);
++                    sp.cpu_bias_map.assign(n_expert, n_expert);
++                    sp.n_hit = 0;
++                    sp.n_eviction = 0;
++                    std::vector<uint64_t> token_zero((size_t) n_tokens, 0);
++                    for (int64_t t = 0; t < n_tokens; ++t) {
++                        for (int64_t k = 0; k < selected_per_token; ++k) {
++                            const int32_t e = ids[(size_t)(t * selected_per_token + k)];
++                            if (e < 0 || e >= n_expert) continue;
++                            if (sp.gpu_map[e] >= 0) continue; // already mapped in this batch
++                            if (e < k_hot_gpu) {
++                                sp.gpu_map[e] = sbase + e;
++                                sp.gpu_bias_map[e] = e;
++                                ++sp.n_hit;
++                            } else {
++                                // Assign a distinct zero-weight GPU slot for this miss
++                                uint64_t used = 0;
++                                for (int64_t tt = 0; tt < n_tokens; ++tt) {
++                                    for (int64_t kk = 0; kk < selected_per_token; ++kk) {
++                                        if (ids[(size_t)(tt * selected_per_token + kk)] == e) {
++                                            used |= token_zero[(size_t) tt];
++                                        }
++                                    }
++                                }
++                                int32_t z = 0;
++                                while (z < g.zero_slots && (used & (UINT64_C(1) << z))) ++z;
++                                if (z >= g.zero_slots) z = 0;
++                                for (int64_t tt = 0; tt < n_tokens; ++tt) {
++                                    for (int64_t kk = 0; kk < selected_per_token; ++kk) {
++                                        if (ids[(size_t)(tt * selected_per_token + kk)] == e) {
++                                            token_zero[(size_t) tt] |= UINT64_C(1) << z;
++                                        }
++                                    }
++                                }
++                                sp.gpu_map[e] = g.n_slots + z;
++                                sp.cpu_map[e] = e;
++                                sp.cpu_bias_map[e] = e;
++                                sp.cpu.push_back({e, g.n_slots + z});
++                            }
++                        }
++                    }
++                } else if (!g.cache.plan_with_cpu_share(il, ids.data(), ids.size(), n_tokens, selected_per_token,
+                         cpu_share, g.zero_slots, l.share_plan)) {
+                     GGML_ABORT("Unable to plan MoE CPU-share assignments for layer %d", il);
+                 }
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 31b41bd..59e83d8 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -37,6 +37,11 @@
+ #include "ggml-alloc.h"
+ #include "ggml-backend.h"
+ 
++extern "C" {
++    int  ggml_moe_hot_experts_count(void);
++    void ggml_moe_warm_hot_prefix(const void * data, size_t hot_bytes, size_t total_bytes);
++}
++
+ #include <cmath>
+ 
+ void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_context * target_ctx);
+@@ -5579,6 +5584,47 @@ static bool llm_load_tensors(
+         if (defer_ple_mmap) {
+             ml.apply_ple_mmap_policy();
+         }
++
++        // Frequency-sorted hot-expert prefix warming + cold-tail isolation (IK_HOT_EXPERTS=N)
++        if (ml.use_mmap && !dry_run && ggml_moe_hot_experts_count() > 0) {
++            const int k_hot = ggml_moe_hot_experts_count();
++            struct warm_job { const void * data; size_t hot_bytes; size_t total_bytes; };
++            std::vector<warm_job> jobs;
++            size_t tot_hot = 0, tot_cold = 0;
++            for (auto & it : ctx_bufs) {
++                ggml_context * ctx = it.first;
++                for (auto * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
++                    if (!cur->buffer || !ggml_backend_buffer_is_host(cur->buffer) || !cur->data) continue;
++                    if (cur->ne[2] <= k_hot) continue;
++                    const char * tname = ggml_get_name(cur);
++                    if (!tname || strstr(tname, "_exps.weight") == nullptr) continue;
++                    const size_t total_b = ggml_nbytes(cur);
++                    const size_t hot_b   = std::min<size_t>(total_b, (size_t)k_hot * cur->nb[2]);
++                    jobs.push_back({ cur->data, hot_b, total_b });
++                    tot_hot  += hot_b;
++                    tot_cold += (total_b - hot_b);
++                }
++            }
++            if (!jobs.empty()) {
++                LLAMA_LOG_INFO("%s: IK_HOT_EXPERTS=%d: warming %.2f GiB hot prefix into RAM, isolating %.2f GiB cold tail on SSD (%zu tensors)\n",
++                        __func__, k_hot, tot_hot / (1024.0*1024.0*1024.0), tot_cold / (1024.0*1024.0*1024.0), jobs.size());
++                std::atomic<size_t> next_job{0};
++                const int n_warm_threads = 4;
++                std::vector<std::thread> warmers;
++                warmers.reserve(n_warm_threads);
++                for (int t = 0; t < n_warm_threads; ++t) {
++                    warmers.emplace_back([&]() {
++                        for (;;) {
++                            size_t idx = next_job.fetch_add(1, std::memory_order_relaxed);
++                            if (idx >= jobs.size()) break;
++                            ggml_moe_warm_hot_prefix(jobs[idx].data, jobs[idx].hot_bytes, jobs[idx].total_bytes);
++                        }
++                    });
++                }
++                for (auto & w : warmers) w.join();
++                LLAMA_LOG_INFO("%s: hot-expert prefix warm-up complete.\n", __func__);
++            }
++        }
+ #if defined(_WIN32)
+         // Without --defer-ple, fault sparse tables in synchronously (prefetch is best-effort).
+         auto touch_host = [](struct ggml_tensor * t) {

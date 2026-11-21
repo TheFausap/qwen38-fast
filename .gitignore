@@ -1,0 +1,21 @@
+# Build artifacts & compiled shared libraries
+*.so
+*.o
+*.a
+build/
+
+# Upstream clones (reproducible from commit hashes in README.md)
+ik_llama.cpp/
+llama_converter/
+
+# Python virtual environment & caches
+.venv/
+__pycache__/
+*.pyc
+
+# Large GGUF model files & calibration stats (keep small expert_perm.json)
+models/*
+!models/expert_perm.json
+*.gguf
+*.gguf_file
+*.safetensors
